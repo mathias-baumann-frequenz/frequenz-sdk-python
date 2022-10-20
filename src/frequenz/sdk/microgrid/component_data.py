@@ -11,8 +11,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+import frequenz.api.microgrid.battery_pb2 as battery_pb
+import frequenz.api.microgrid.inverter_pb2 as inverter_pb
 import frequenz.api.microgrid.microgrid_pb2 as microgrid_pb
 import pytz
 
@@ -127,6 +129,11 @@ class BatteryData(ComponentData):
         power_upper_bound: the maximum charge power, in Watts, represented in the
             passive sign convention. This will be a positive number, or zero if no
             charging is possible.
+        relay_state: state of the battery relays. Each Relay is described in the
+            frequenz-api-microgrid.
+        component_state: state of the battery. Each State is described in the
+            frequenz-api-microgrid.
+        errors: list of errors from the component.
     """
 
     soc: float
@@ -135,6 +142,9 @@ class BatteryData(ComponentData):
     capacity: float
     power_lower_bound: float
     power_upper_bound: float
+    relay_state: battery_pb.RelayState.ValueType
+    component_state: battery_pb.ComponentState.ValueType
+    errors: List[battery_pb.Error]
 
     @classmethod
     def from_proto(cls, raw: microgrid_pb.ComponentData) -> BatteryData:
@@ -155,6 +165,9 @@ class BatteryData(ComponentData):
             capacity=raw.battery.properties.capacity,
             power_lower_bound=raw.battery.data.dc.power.system_bounds.lower,
             power_upper_bound=raw.battery.data.dc.power.system_bounds.upper,
+            relay_state=raw.battery.state.relay_state,
+            component_state=raw.battery.state.component_state,
+            errors=list(raw.battery.errors),
         )
         battery_data._set_raw(raw=raw)
         return battery_data
@@ -175,11 +188,16 @@ class InverterData(ComponentData):
         active_power_upper_bound: the maximum charge power, in Watts, represented in
             the passive sign convention. This will be a positive number, or zero if no
             charging is possible.
+        component_state: state of the inverter. Each State is described in the
+            frequenz-api-microgrid.
+        errors: list of errors from the component.
     """
 
     active_power: float
     active_power_lower_bound: float
     active_power_upper_bound: float
+    component_state: inverter_pb.ComponentState.ValueType
+    errors: List[inverter_pb.Error]
 
     @classmethod
     def from_proto(cls, raw: microgrid_pb.ComponentData) -> InverterData:
@@ -197,6 +215,8 @@ class InverterData(ComponentData):
             active_power=raw.inverter.data.ac.power_active.value,
             active_power_lower_bound=raw.inverter.data.ac.power_active.system_bounds.lower,
             active_power_upper_bound=raw.inverter.data.ac.power_active.system_bounds.upper,
+            component_state=raw.inverter.state.component_state,
+            errors=list(raw.inverter.errors),
         )
         inverter_data._set_raw(raw=raw)
         return inverter_data
