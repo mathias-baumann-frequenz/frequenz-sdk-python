@@ -9,7 +9,6 @@ License
 MIT
 """
 import asyncio
-import datetime as dt
 import logging
 from asyncio.tasks import ALL_COMPLETED
 from typing import (  # pylint: disable=unused-import
@@ -24,17 +23,18 @@ from typing import (  # pylint: disable=unused-import
 )
 
 import grpc
-import pytz
 from frequenz.channels import BidirectionalHandle, Peekable, Receiver
 from google.protobuf.empty_pb2 import Empty  # pylint: disable=no-name-in-module
 
 from ..actor import actor
+from ..battery_status.battery_status import BatteryStatus
+from ..battery_status.utils import BatteryResult
 from ..microgrid.client import MicrogridApiClient
 from ..microgrid.component import Component, ComponentCategory
 from ..microgrid.component_data import BatteryData, InverterData
 from ..microgrid.graph import ComponentGraph
-from .distribution_algorithm import DistributionAlgorithm
-from .utils import BrokenComponents, InvBatPair, Request, Result, User
+from .distribution_algorithm import DistributionAlgorithm, DistributionResult
+from .utils import InvBatPair, Request, Result, User
 
 _logger = logging.getLogger(__name__)
 
@@ -136,14 +136,12 @@ class PowerDistributor:
         # Formulas will put 0 in place of data from this components.
         # This will happen until component starts sending data.
         self.component_data_timeout_sec: float = 60.0
-        self.broken_component_timeout_sec: float = 30.0
         self.power_distributor_exponent: float = 1.0
 
         # distributor_exponent and timeout_sec should be get from ConfigManager
         self.distribution_algorithm = DistributionAlgorithm(
             self.power_distributor_exponent
         )
-        self._broken_components = BrokenComponents(self.broken_component_timeout_sec)
 
         self._bat_inv_map, self._inv_bat_map = self._get_components_pairs(
             component_graph
@@ -166,6 +164,9 @@ class PowerDistributor:
         ] = users_channels
         self._create_users_tasks()
         self._started = asyncio.Event()
+        self._battery_status = BatteryStatus(
+            set(self._bat_inv_map.keys()), self.component_data_timeout_sec
+        )
 
     def _create_users_tasks(self) -> None:
         """For each user create a task to wait for request."""
@@ -227,8 +228,6 @@ class PowerDistributor:
         It waits for new requests in task_queue and process it, and send
         `set_power` request with distributed power.
         The output of the `set_power` method is processed.
-        Every battery and inverter that failed or didn't respond in time will be marked
-        as broken for some time.
         """
         await self._create_channels()
 
@@ -238,21 +237,32 @@ class PowerDistributor:
         while True:
             request, user = await self._request_queue.get()
 
-            try:
-                pairs_data: List[InvBatPair] = self._get_components_data(
-                    request.batteries
+            working_batteries = self._battery_status.get_working_batteries()
+            # Intersect requested batteries to use only working batteries
+            # from the request.
+            batteries = request.batteries & working_batteries
+            if len(batteries) == 0:
+                err = "None of the requested batteries is working."
+                await user.channel.send(
+                    Result(Result.Status.ERROR, request.power, 0, str(err))
                 )
+                continue
+
+            try:
+                pairs_data: List[InvBatPair] = self._get_components_data(batteries)
             except KeyError as err:
                 await user.channel.send(
                     Result(Result.Status.ERROR, request.power, 0, str(err))
                 )
                 continue
+
             if len(pairs_data) == 0:
-                error_msg = f"No data for the given batteries {str(request.batteries)}"
+                error_msg = f"No data for the given batteries {str(batteries)}"
                 await user.channel.send(
                     Result(Result.Status.ERROR, request.power, 0, str(error_msg))
                 )
                 continue
+
             try:
                 distribution = self.distribution_algorithm.distribute_power(
                     request.power, pairs_data
@@ -286,14 +296,16 @@ class PowerDistributor:
             )
 
             await self._cancel_tasks(pending)
-            any_fail, failed_power = self._parse_result(
-                tasks, distribution.distribution, request.request_timeout_sec
+            result, batteries_result = self._parse_distribution_result(
+                tasks, distribution, request.request_timeout_sec
             )
 
-            status = Result.Status.FAILED if any_fail else Result.Status.SUCCESS
-            await user.channel.send(
-                Result(status, failed_power, distribution.remaining_power)
-            )
+            for battery_id in request.batteries:
+                if battery_id not in batteries_result:
+                    batteries_result[battery_id] = BatteryResult.UNUSED
+
+            self._battery_status.update_battery_result(batteries_result)
+            await user.channel.send(result)
 
     def _check_request(self, request: Request) -> Optional[Result]:
         """Check whether the given request if correct.
@@ -304,7 +316,9 @@ class PowerDistributor:
         Returns:
             Result for the user if the request is wrong, None otherwise.
         """
-        for battery in request.batteries:
+        working_batteries = self._battery_status.get_working_batteries()
+        batteries = working_batteries & request.batteries
+        for battery in batteries:
             if battery not in self._battery_receivers:
                 msg = (
                     f"No battery {battery}, available batteries: "
@@ -484,10 +498,6 @@ class PowerDistributor:
                 )
 
             inverter_id: int = self._bat_inv_map[battery_id]
-            if self._broken_components.is_broken(
-                battery_id
-            ) or self._broken_components.is_broken(inverter_id):
-                continue
 
             battery_data: Optional[BatteryData] = self._battery_receivers[
                 battery_id
@@ -521,20 +531,9 @@ class PowerDistributor:
             True if data are correct, false otherwise
         """
         if component_data is None:
-            _logger.warning(
-                "No data from component %d.",
+            _logger.error(
+                "No data from component %d. But BatteryStatus returned it.",
                 component_id,
-            )
-            return False
-
-        now = dt.datetime.now(tz=pytz.UTC)
-        time_delta = now - component_data.timestamp
-        if time_delta.total_seconds() > self.component_data_timeout_sec:
-            _logger.warning(
-                "Component %d data are stale. Last timestamp: %s, now: %s",
-                component_id,
-                str(component_data.timestamp),
-                str(now),
             )
             return False
 
@@ -551,31 +550,30 @@ class PowerDistributor:
             )
             self._inverter_receivers[inverter_id] = inv_recv.into_peekable()
 
-    def _parse_result(
+    def _parse_distribution_result(
         self,
         # type comment to quiet pylint and mypy `unused-import` error
         tasks,  # type: Dict[int, asyncio.Task[Empty]]
-        distribution: Dict[int, int],
+        distribution: DistributionResult,
         request_timeout_sec: float,
-    ) -> Tuple[bool, int]:
+    ) -> Tuple[Result, Dict[int, BatteryResult]]:
         """Parse result of `set_power` requests.
 
-        Check if any task failed and why. If any task didn't success, then corresponding
-        battery is marked as broken.
+        Check if any task failed and why.
 
         Args:
             tasks: Dictionary where key is inverter id and value is task that set power
                 for this inverter. Each tasks should be finished or cancelled.
-            distribution: Dictionary where key is inverter id and value is how much
-                power was set to the corresponding inverter.
+            distribution: Distribution result.
             request_timeout_sec: timeout which has been used for request.
 
         Returns:
-            Tuple where first element tells if any task didn't succeed,
-            and the second element is total amount of power that failed.
+            Tuple where first element is summary result to be send to the user, and
+            second element is the result for each used battery.
         """
         any_fail: bool = False
         failed_power: int = 0
+        battery_result: Dict[int, BatteryResult] = {}
 
         for inverter_id, aws in tasks.items():
             battery_id = self._inv_bat_map[inverter_id]
@@ -583,31 +581,43 @@ class PowerDistributor:
                 aws.result()
             except grpc.aio.AioRpcError as err:
                 any_fail = True
-                failed_power += distribution[inverter_id]
+                failed_power += distribution.distribution[inverter_id]
                 if err.code() == grpc.StatusCode.OUT_OF_RANGE:
                     _logger.debug(
                         "Set power for battery %d failed, error %s",
                         battery_id,
                         str(err),
                     )
+                    battery_result[battery_id] = BatteryResult.OUT_OF_RANGE
+
                 else:
-                    _logger.warning(
-                        "Set power for battery %d failed, error %s. Mark it as broken.",
+                    _logger.error(
+                        "Set power for battery %d failed, error %s.",
                         battery_id,
                         str(err),
                     )
-                    self._broken_components.mark_as_broken(battery_id)
+                    battery_result[battery_id] = BatteryResult.ERROR
             except asyncio.exceptions.CancelledError:
                 any_fail = True
-                failed_power += distribution[inverter_id]
+                failed_power += distribution.distribution[inverter_id]
                 _logger.warning(
-                    "Battery %d didn't respond in %f sec. Mark it as broken.",
+                    "Battery %d didn't respond in %f sec.",
                     battery_id,
                     request_timeout_sec,
                 )
-                self._broken_components.mark_as_broken(battery_id)
+                battery_result[battery_id] = BatteryResult.UNKNOWN_RESULT
+            else:
+                battery_result[battery_id] = BatteryResult.SUCCESS
 
-        return any_fail, failed_power
+        status = Result.Status.FAILED if any_fail else Result.Status.SUCCESS
+        return (
+            Result(
+                status=status,
+                failed_power=failed_power,
+                above_upper_bound=distribution.remaining_power,
+            ),
+            battery_result,
+        )
 
     async def _cancel_tasks(self, tasks: Iterable["asyncio.Task[Any]"]) -> None:
         """Cancel given asyncio tasks and wait for them.

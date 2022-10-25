@@ -7,9 +7,8 @@ License
 MIT
 """
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum
-from typing import Dict, NamedTuple, Optional, Set
+from typing import NamedTuple, Optional, Set
 
 from frequenz.channels import BidirectionalHandle
 
@@ -77,52 +76,3 @@ class User:
     user_id: str
     # Channel for the communication
     channel: BidirectionalHandle[Result, Request]
-
-
-class BrokenComponents:
-    """Store components marked as broken."""
-
-    def __init__(self, timeout_sec: float) -> None:
-        """Create object instance.
-
-        Args:
-            timeout_sec: How long the component should be marked as broken.
-        """
-        self._broken: Dict[int, datetime] = {}
-        self._timeout_sec = timeout_sec
-
-    def mark_as_broken(self, component_id: int) -> None:
-        """Mark component as broken.
-
-        After marking component as broken it would be considered as broken for
-        self._timeout_sec.
-
-        Args:
-            component_id: component id
-        """
-        self._broken[component_id] = datetime.now()
-
-    def update_retry(self, timeout_sec: float) -> None:
-        """Change how long the component should be marked as broken.
-
-        Args:
-            timeout_sec: New retry time after sec.
-        """
-        self._timeout_sec = timeout_sec
-
-    def is_broken(self, component_id: int) -> bool:
-        """Check if component is marked as broken.
-
-        Args:
-            component_id: component id
-
-        Returns:
-            True if component is broken, False otherwise.
-        """
-        if component_id in self._broken:
-            last_broken = self._broken[component_id]
-            if (datetime.now() - last_broken).total_seconds() < self._timeout_sec:
-                return True
-
-            del self._broken[component_id]
-        return False
