@@ -5,18 +5,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Generic, List, Sequence, TypeVar
+from typing import Any, Generic, List, TypeVar
 
-import numpy as np
+import numpy.typing as npt
+from numpy import concatenate, float64
 from numpy.lib import math
 
 from frequenz.sdk.timeseries import Sample
 
-Container = TypeVar("Container", list, np.ndarray)
-
+Container = TypeVar("Container", List[float], npt.NDArray[float64])
 
 @dataclass
 class Gap:
@@ -60,7 +61,6 @@ class OrderedRingBuffer(Generic[Container]):
                 timestamped data with the index position in the buffer.
                 Used to make the data stored in the buffer align with the
                 beginning and end of the buffer borders.
-
                 For example, if the `time_index_alignment` is set to
                 "0001-01-01 12:00:00", and the `sampling_period` is set to
                 1 hour and the length of the buffer is 24, then the data
@@ -129,7 +129,7 @@ class OrderedRingBuffer(Generic[Container]):
         # Don't add outdated entries
         if timestamp < self._datetime_oldest and self._datetime_oldest != datetime.max:
             raise IndexError(
-                f"Timestamp too old (cut-off is at {self._datetime_oldest})."
+                f"Timestamp {timestamp} too old (cut-off is at {self._datetime_oldest})."
             )
 
         # Update timestamps
@@ -204,7 +204,8 @@ class OrderedRingBuffer(Generic[Container]):
                 copy of the data.
 
         Raises:
-            IndexError: when requesting a window with invalid timestamps.
+            IndexError: When requesting a window with invalid timestamps.
+            TypeError: When an internal error happened concerning the types.
 
         Returns:
             The requested window
@@ -225,17 +226,22 @@ class OrderedRingBuffer(Generic[Container]):
                 if isinstance(self._buffer, list):
                     window += self._buffer[0:end_index]
                 else:
-                    window = np.concatenate((window, self._buffer[0:end_index]))
+                    window = concatenate((window, self._buffer[0:end_index]))
             return window
 
-        def in_gap(gap) -> bool:
-            return gap.contains(start) or gap.contains(end)
-
         # Return a copy if there are none-values in the data
-        if force_copy or any(map(in_gap, self._gaps)):
-            return deepcopy(self._buffer[start_index:end_index])
+        if force_copy or any(map(lambda gap: gap.contains(start) or gap.contains(end), self._gaps)):
+            # Make type system happy
+            ret = deepcopy(self[start_index:end_index])
+            if not isinstance(ret, float):
+                return ret
+            raise TypeError("Type error while copying data.")
 
-        return self._buffer[start_index:end_index]
+        # Make type system happy
+        ret = self[start_index:end_index]
+        if not isinstance(ret, float):
+            return ret
+        raise TypeError("Type error while copying data.")
 
     def is_missing(self, timestamp: datetime) -> bool:
         """Check if the given timestamp falls within a gap.
@@ -386,19 +392,29 @@ class OrderedRingBuffer(Generic[Container]):
         """
         return index % self.maxlen
 
-    def __setitem__(self, index_or_slice: int | slice, value: float) -> None:
+    def __setitem__(
+        self, index_or_slice: int | slice, value: float | Iterable[float]
+    ) -> None:
         """Set item or slice at requested position.
 
         No wrapping of the index will be done.
         Create a feature request if you require this function.
 
+        Raises:
+            TypeError: When the arguments are not compatible.
+
         Args:
             index_or_slice: Index or slice specification of the requested data.
             value: Value to set at the given position.
         """
-        self._buffer.__setitem__(index_or_slice, value)
+        if isinstance(index_or_slice, int):
+            self._buffer.__setitem__(index_or_slice, value)
+        elif isinstance(index_or_slice, slice) and isinstance(value, Iterable):
+            self._buffer.__setitem__(index_or_slice, value)
+        else:
+            raise TypeError("Called with incompatible types.")
 
-    def __getitem__(self, index_or_slice: int | slice) -> float | Sequence[float]:
+    def __getitem__(self, index_or_slice: int | slice) -> float | Container:
         """Get item or slice at requested position.
 
         No wrapping of the index will be done.
@@ -407,10 +423,18 @@ class OrderedRingBuffer(Generic[Container]):
         Args:
             index_or_slice: Index or slice specification of the requested data.
 
+        Raises:
+            TypeError: When the arguments are not compatible.
+
         Returns:
             The requested value or slice.
         """
-        return self._buffer.__getitem__(index_or_slice)
+        if isinstance(index_or_slice, int):
+            return self._buffer.__getitem__(index_or_slice)
+        if isinstance(index_or_slice, slice):
+            return self._buffer.__getitem__(index_or_slice)
+
+        raise TypeError("Called with incompatible types.")
 
     def __len__(self) -> int:
         """Return the amount of items that this container currently holds.

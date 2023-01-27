@@ -11,6 +11,7 @@ from itertools import cycle, islice
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 from frequenz.sdk.timeseries import Sample

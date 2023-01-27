@@ -14,6 +14,7 @@
 
 * A new class `OrderedRingBuffer` is now available, providing a sorted ring buffer of datetime-value pairs with tracking of any values that have not yet been written.
 * Add logical meter formula for EV power.
+* A new class `SerializedRingbuffer` is now available, extending the `OrderedRingBuffer` class with the ability to load & dump the data to disk.
 
 ## Bug Fixes
 
